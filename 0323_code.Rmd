@@ -1,0 +1,564 @@
+---
+title: 'Kickstarter Project'
+date: "2022/1/27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## Library
+```{r message=FALSE, warning=FALSE}
+library(tm)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(tokenizers)
+library(tidyverse)
+library(caret)
+library(proxy)
+library(qdapRegex)
+library(tidytext)
+library(e1071)
+library(caTools)
+library(randomForest)
+library(glmnet)
+library(text2vec)
+library(rpart)
+library(rpart.plot)
+library(ggplot2)
+```
+
+## Preprocess
+```{r}
+library(cld3)
+data = read.csv(file = "kickstarter.csv", sep = ",", encoding="UTF-8")
+data = data[-c(11, 39, 41, 54, 74, 163, 170, 261, 285, 299, 313, 325, 379, 406, 445, 542, 556, 570, 107, 90, 101, 102, 111, 149, 216, 241, 287, 502), ]
+data = data[which(detect_language(data$story)=="en"), ]
+
+data$story = gsub("\n", " ", data$story, perl = T)
+data$story = rm_url(data$story)
+data = subset(data[which(data$state!="CANCELED"),])
+data = subset(data[which(data$state!="LIVE"),])
+data$state = as.factor(data$state)
+data$environmentalCommitments = as.factor(data$environmentalCommitments)
+data = data[complete.cases(data), ]
+```
+
+```{r}
+undersampling <- function(df){
+  success_cases = df[which(df$state == "SUCCESSFUL"), ]
+  failed_cases = df[which(df$state == "FAILED"), ]
+  success_sample = success_cases[sample(1:nrow(success_cases), 81),]
+  df = rbind(success_sample, failed_cases)
+  return(df)
+}
+
+labeler <- function(df){
+  for(i in seq_along(df$state)){
+    if (df$state[i] == "SUCCESSFUL"){
+      df$label[i] = 1
+    }else{
+      df$label[i] = 0
+    }
+  }
+  for(i in seq_along(df$environmentalCommitments)){
+    if (df$environmentalCommitments[i] == "True"){
+      df$label_env[i] = 1
+    }else{
+      df$label_env[i] = 0
+    }
+  }
+  return(df)
+}
+```
+
+
+```{r warning=FALSE}
+data = labeler(data)
+
+corpus = Corpus(VectorSource(data$story))
+
+dtm_tfidf = DocumentTermMatrix(corpus,
+                               control = list(weighting = weightTfIdf,
+                               stopwords = stopwords(), 
+                               removePunctuation = T,
+                               removeNumbers = T,
+                               stemming = T))
+
+dtm_tfidf = removeSparseTerms(dtm_tfidf, 0.41)
+head(dtm_tfidf)
+
+clean_data = subset(data, select = -c(X, id, typename, currency, isSharingProjectBudget,  
+risks, environmentalCommitments))
+
+clean_data = cbind(clean_data, data.frame(as.matrix(dtm_tfidf)))
+
+set.seed(256)
+sampled_data = undersampling(clean_data)
+sampled_data = subset(sampled_data, select = -c(state))
+sampled_data$label = as.factor(sampled_data$label)
+trainIndex = createDataPartition(sampled_data$label, p=0.8, list=FALSE)
+train_set = sampled_data[trainIndex, ]
+test_set = sampled_data[-trainIndex, ]
+```
+
+## Sentiment Analysis
+```{r}
+sentiment_words = as.data.frame(get_sentiments("bing"))
+positive = subset(sentiment_words, sentiment == "positive")
+positive_words = positive$word
+negative = subset(sentiment_words, sentiment == "negative")
+negative_words = negative$word
+negative_words = negative_words[-grep("[^a-z0-9 ]", negative_words, perl = T)]
+
+testLen = 32
+trainLen = 130
+
+text_length = function(text){
+  textLength = str_count(text, '\\w+')
+  return(textLength)
+}
+
+search_positive = function(text){
+  token = unlist(tokenize_words(text))
+  search = token %in% positive_words
+  return(length(which(search == "TRUE")))
+}
+
+search_negative = function(text){
+  token = unlist(tokenize_words(text))
+  search = token %in% negative_words
+  return(length(which(search == "TRUE")))
+}
+
+train_set_feature = train_set[1:3]
+for(i in 1:trainLen){
+train_set_feature$sentiment[i] = search_positive(train_set_feature$story[i])-search_negative(train_set_feature$story[i])
+}
+
+test_set_feature = test_set[1:3]
+for(i in 1:testLen){
+test_set_feature$sentiment[i] = search_positive(test_set_feature$story[i])-search_negative(test_set_feature$story[i])
+}
+
+
+for (i in 1:trainLen) {
+  train_set_feature$sentiment[i] = train_set_feature$sentiment[i]/text_length(train_set_feature$story[i])
+}
+
+for (i in 1:testLen) {
+  test_set_feature$sentiment[i] = test_set_feature$sentiment[i]/text_length(test_set_feature$story[i])
+}
+
+for(i in 1:trainLen){
+  train_set_feature$positive[i] = search_positive(train_set_feature$story[i])
+}
+
+for(i in 1:testLen){
+  test_set_feature$positive[i] = search_positive(test_set_feature$story[i])
+}
+
+for (i in 1:trainLen) {
+  train_set_feature$positive[i] = train_set_feature$positive[i]/text_length(train_set_feature$story[i])
+}
+
+for (i in 1:testLen) {
+  test_set_feature$positive[i] = test_set_feature$positive[i]/text_length(test_set_feature$story[i])
+}
+
+for(i in 1:trainLen){
+  train_set_feature$negative[i] = search_negative(train_set_feature$story[i])
+}
+
+for(i in 1:testLen){
+  test_set_feature$negative[i] = search_negative(test_set_feature$story[i])
+}
+
+for (i in 1:trainLen) {
+  train_set_feature$negative[i] = train_set_feature$negative[i]/text_length(train_set_feature$story[i])
+}
+
+for (i in 1:testLen) {
+  test_set_feature$negative[i] = test_set_feature$negative[i]/text_length(test_set_feature$story[i])
+}
+```
+
+## Pronoun
+```{r}
+first_person_singular = c("I", "me", "mine", "myself", "my")
+first_person_plural = c("we", "us", "our", "ours", "ourselves")
+second_person = c("you", "your", "yours", "yourself", "yourselves")
+third_person_singular = c("he", "him", "his", "she", "her", "hers", "it", "its")
+third_person_plural = c("they", "them", "their", "theirs")
+
+search_first_singular = function(text){
+  token = unlist(tokenize_words(text))
+  search = token %in% first_person_singular
+  return(length(which(search == "TRUE")))
+}
+
+search_first_plural = function(text){
+  token = unlist(tokenize_words(text))
+  search = token %in% first_person_plural
+  return(length(which(search == "TRUE")))
+}
+
+search_second = function(text){
+  token = unlist(tokenize_words(text))
+  search = token %in% second_person
+  return(length(which(search == "TRUE")))
+}
+
+search_third_singular = function(text){
+  token = unlist(tokenize_words(text))
+  search = token %in% third_person_singular
+  return(length(which(search == "TRUE")))
+}
+
+search_third_plural = function(text){
+  token = unlist(tokenize_words(text))
+  search = token %in% third_person_plural
+  return(length(which(search == "TRUE")))
+}
+
+
+for(i in 1:trainLen){
+  train_set_feature$first_singular[i] = search_first_singular(train_set_feature$story[i]) / text_length(train_set_feature$story[i]) 
+}
+
+for(i in 1:testLen){
+  test_set_feature$first_singular[i] = search_first_singular(test_set_feature$story[i]) / text_length(test_set_feature$story[i]) 
+}
+
+for(i in 1:trainLen){
+  train_set_feature$first_plural[i] = search_first_plural(train_set_feature$story[i]) / text_length(train_set_feature$story[i])
+}
+
+for(i in 1:testLen){
+  test_set_feature$first_plural[i] = search_first_plural(test_set_feature$story[i]) / text_length(test_set_feature$story[i])
+}
+
+for(i in 1:trainLen){
+  train_set_feature$second[i] = search_second(train_set_feature$story[i]) / text_length(train_set_feature$story[i])
+}
+
+for(i in 1:testLen){
+  test_set_feature$second[i] = search_second(test_set_feature$story[i]) / text_length(test_set_feature$story[i])
+}
+
+for(i in 1:trainLen){
+  train_set_feature$third_singular[i] = search_third_singular(train_set_feature$story[i]) / text_length(train_set_feature$story[i])
+}
+
+for(i in 1:testLen){
+  test_set_feature$third_singular[i] = search_third_singular(test_set_feature$story[i]) / text_length(test_set_feature$story[i])
+}
+
+for(i in 1:trainLen){
+  train_set_feature$third_plural[i] = search_third_plural(train_set_feature$story[i]) / text_length(train_set_feature$story[i])
+}
+
+for(i in 1:testLen){
+  test_set_feature$third_plural[i] = search_third_plural(test_set_feature$story[i]) / text_length(test_set_feature$story[i])
+}
+```
+
+## Concreteness
+```{r}
+#百分比
+percentage = c("percent", "percentage", "%")
+search_percentage = function(text){
+  token = unlist(tokenize_words(text))
+  search = token %in% first_person_singular
+  return(length(which(search == "TRUE"))/text_length(text))
+}
+
+for(i in 1:trainLen){
+  train_set_feature$concreteness_percent[i] = search_percentage(train_set_feature$story[i])
+}
+
+for(i in 1:testLen){
+  test_set_feature$concreteness_percent[i] = search_percentage(test_set_feature$story[i])
+}
+
+#日期&時間
+search_time = function(text){
+  total = 0
+  m_d_y = "(?:(?:31(\\/|-|\\.)(?:0?[13578]|1[02]))\1|(?:(?:29|30)(\\/|-|\\.)(?:0?[13-9]|1[0-2])\2))(?:(?:1[6-9]|[2-9]\\d)?\\d{2})$|^(?:29(\\/|-|\\.)0?2\3(?:(?:(?:1[6-9]|[2-9]\\d)?(?:0[48]|[2468][048]|[13579][26])|(?:(?:16|[2468][048]|[3579][26])00))))$|^(?:0?[1-9]|1\\d|2[0-8])(\\/|-|\\.)(?:(?:0?[1-9])|(?:1[0-2]))\4(?:(?:1[6-9]|[2-9]\\d)?\\d{2})"
+  y_m_d = "((19|20)\\d{2})(\\/|\\.|-)\\d{1,2}(\\/|\\.|-)\\d{1,2}"
+  big_month = "(Jan|January|Feb|February|Mar|March|Apr|April|May|Jun|June|Jul|July|Aug|August|Sep|September|Oct|October|Nov|November|Dec|December)( )(\\d{1,2})"
+  time = "((([0]?[1-9]|1[0-2]):[0-5][0-9](:[0-5][0-9])?( )?(AM|am|aM|Am|PM|pm|pM|Pm))|(([0]?[0-9]|1[0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?))"
+  mdy_count = str_count(string = text, pattern = m_d_y)
+  ymd_count = str_count(string = text, pattern = y_m_d)
+  big_count = str_count(string = text, pattern = big_month)
+  time_count = str_count(string = text, pattern = time)
+  total = mdy_count + ymd_count + big_count + time_count
+  return(total)
+}
+
+
+for(i in 1:trainLen){
+train_set_feature$concreteness_time[i] = search_time(train_set_feature$story[i]) / text_length(train_set_feature$story[i])  
+}
+
+for(i in 1:testLen){
+test_set_feature$concreteness_time[i] = search_time(test_set_feature$story[i]) / text_length(test_set_feature$story[i])  
+}
+```
+
+## Scaling
+```{r}
+tfidf_train_set = subset(train_set, select = -c(label_env, story))
+tfidf_test_set = subset(test_set, select = -c(label_env,story))
+
+feature_train_set = cbind(train_set_feature[2:3], scale(train_set_feature[,4:13]))
+feature_test_set = cbind(test_set_feature[2:3], scale(test_set_feature[,4:13]))
+
+add_train_set = cbind(tfidf_train_set, train_set_feature[3], scale(train_set_feature[,4:13]))
+add_test_set = cbind(tfidf_test_set, test_set_feature[3], scale(test_set_feature[,4:13]))
+```
+
+## Decision Tree 10-fold Cross Validation
+```{r}
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+
+feature = c("first_singular", "first_plural", "second", "third_singular", "third_plural", "sentiment", "positive", "negative", "concreteness_time", "concreteness_percent", "label_env")
+feature_DT_model<- train(label~., data = feature_train_set, trControl = train_control, method="rpart")
+feature_DT_pred = predict(feature_DT_model, feature_test_set)
+feature_DT_result = confusionMatrix(feature_DT_pred, feature_test_set$label, mode = 'prec_recall')
+
+feature_DT_Im = varImp(feature_DT_model)
+ggplot(feature_DT_Im , aes(importance) +
+geom_bar() +
+coord_flip())
+
+feature_DT_Im_df = feature_DT_Im$importance
+write.csv(file = "feature_DT_Im.csv", feature_DT_Im_df)
+
+tfidf_DT_model<- train(label~., data = tfidf_train_set, trControl = train_control, method = "rpart")
+tfidf_DT_pred = predict(tfidf_DT_model, tfidf_test_set)
+tfidf_DT_result = confusionMatrix(tfidf_DT_pred, tfidf_test_set$label, mode = 'prec_recall')
+
+tfidf_DT_Im = varImp(tfidf_DT_model)
+ggplot(tfidf_DT_Im , aes(importance) +
+geom_bar() +
+coord_flip())
+
+add_DT_model<- train(label~., data = add_test_set, trControl = train_control, method = "rpart")
+add_DT_pred = predict(add_DT_model, add_test_set)
+add_DT_result = confusionMatrix(add_DT_pred, add_test_set$label, mode = 'prec_recall')
+
+add_DT_Im = varImp(add_DT_model)
+ggplot(add_DT_Im , aes(importance) +
+geom_bar() +
+coord_flip())
+```
+
+## Random Forest 10-fold Cross Validation
+```{r}
+feature_RF_model<- train(label~., 
+                         data = feature_train_set, 
+                         trControl = train_control,
+                         method = "cforest")
+
+feature_RF_pred = predict(feature_RF_model, feature_test_set)
+feature_RF_result = confusionMatrix(feature_RF_pred, feature_test_set$label, mode='prec_recall')
+
+feature_RF_Im = varImp(feature_RF_model)
+ggplot(feature_RF_Im , aes(importance) +
+geom_bar() +
+coord_flip())
+
+tfidf_RF_model<- train(label~., 
+                       data = tfidf_train_set, 
+                       trControl = train_control, 
+                       method = "cforest")
+
+tfidf_RF_pred = predict(tfidf_RF_model, tfidf_test_set)
+tfidf_RF_result = confusionMatrix(tfidf_RF_pred, tfidf_test_set$label, mode = 'prec_recall')
+
+tfidf_RF_Im = varImp(tfidf_RF_model)
+ggplot(tfidf_RF_Im , aes(importance) +
+geom_bar() +
+coord_flip())
+
+add_RF_model<- train(label~., 
+                     data = add_train_set, 
+                     trControl = train_control, 
+                     method = "cforest")
+
+add_RF_pred = predict(add_RF_model, add_test_set)
+add_RF_result = confusionMatrix(add_RF_pred, add_test_set$label, mode = 'prec_recall')
+
+add_RF_Im = varImp(add_RF_model)
+ggplot(add_RF_Im , aes(importance) +
+geom_bar() +
+coord_flip())
+```
+
+## Naive Bayes 10-fold Cross Validation
+```{r}
+feature_NB_model<- train(label~., 
+                         data = feature_train_set, 
+                         trControl = train_control, 
+                         method = "naive_bayes")
+
+feature_NB_pred = predict(feature_NB_model, feature_test_set)
+feature_NB_result = confusionMatrix(feature_NB_pred, feature_test_set$label, mode = 'prec_recall')
+
+feature_NB_Im = varImp(feature_NB_model)
+ggplot(feature_NB_Im , aes(importance) +
+geom_bar() +
+coord_flip())
+
+feature_NB_Im_df = feature_NB_Im$importance
+write.csv(file = "feature_NB_Im.csv", feature_NB_Im_df)
+
+tfidf_NB_model<- train(label~., 
+                       data = tfidf_train_set, 
+                       trControl = train_control, 
+                       method = "naive_bayes")
+
+tfidf_NB_pred = predict(tfidf_NB_model, tfidf_test_set)
+tfidf_NB_result = confusionMatrix(tfidf_NB_pred, tfidf_test_set$label, mode='prec_recall')
+
+tfidf_NB_Im = varImp(tfidf_NB_model)
+ggplot(tfidf_NB_Im , aes(importance) +
+geom_bar() +
+coord_flip())
+
+
+add_NB_model<- train(label~., 
+                               data = add_train_set, 
+                               trControl = train_control, 
+                               method = "naive_bayes")
+
+add_NB_pred = predict(add_NB_model, add_test_set)
+add_NB_result = confusionMatrix(add_NB_pred, add_test_set$label, mode='prec_recall')
+
+add_NB_Im = varImp(add_NB_model)
+ggplot(add_NB_Im , aes(importance) +
+geom_bar() +
+coord_flip())
+```
+
+```{r}
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+
+feature_SVM_model<- train(label~., 
+                          data = feature_train_set, 
+                          trControl = train_control, 
+                          method = "svmLinearWeights2")
+
+feature_SVM_pred = predict(feature_SVM_model, feature_test_set)
+feature_SVM_result = confusionMatrix(feature_SVM_pred, feature_test_set$label, mode = 'prec_recall')
+
+feature_SVM_Im = varImp(feature_SVM_model)
+ggplot(feature_SVM_Im , aes(importance) +
+geom_bar() +
+coord_flip())
+
+
+feature_SVM_Im_df = feature_SVM_Im$importance
+write.csv(file = "feature_SVM_Im.csv", feature_SVM_Im_df)
+
+
+tfidf_SVM_model<- train(label~., 
+                        data = tfidf_train_set, 
+                        trControl = train_control, 
+                        method = "svmLinearWeights2")
+
+tfidf_SVM_pred = predict(tfidf_SVM_model, tfidf_test_set)
+tfidf_SVM_result = confusionMatrix(tfidf_SVM_pred, tfidf_test_set$label, mode = 'prec_recall')
+
+tfidf_SVM_Im = varImp(tfidf_SVM_model)
+ggplot(tfidf_SVM_Im , aes(importance) +
+geom_bar() +
+coord_flip())
+
+add_SVM_model<- train(label~., 
+                      data = add_train_set, 
+                      trControl = train_control, 
+                      method = "svmLinearWeights2")
+
+add_SVM_pred = predict(add_SVM_model, add_test_set)
+add_SVM_result = confusionMatrix(add_SVM_pred, add_test_set$label, mode = 'prec_recall')
+
+add_SVM_Im = varImp(add_SVM_model)
+ggplot(add_SVM_Im , aes(importance) +
+geom_bar() +
+coord_flip())
+```
+
+## Logistic regression
+
+```{r}
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+feature_LR_model <- train(label~., data = feature_train_set, trControl = train_control, method = "glmnet")
+feature_LR_pred = predict(feature_LR_model, feature_test_set)
+feature_LR_result = confusionMatrix(feature_LR_pred, feature_test_set$label, mode = 'prec_recall')
+
+feature_LR_Im = varImp(feature_LR_model)
+ggplot(feature_SVM_Im , aes(importance) +
+geom_bar() +
+coord_flip())
+
+feature_LR_Im_df = feature_LR_Im$importance
+write.csv(file = "feature_LR_Im.csv", feature_LR_Im_df)
+
+
+tfidf_LR_model <- train(label~., data = tfidf_train_set, trControl = train_control, method = "glmnet")
+tfidf_LR_pred = predict(tfidf_LR_model, tfidf_test_set)
+tfidf_LR_result = confusionMatrix(tfidf_LR_pred, tfidf_test_set$label, mode = 'prec_recall')
+tfidf_LR_Im = varImp(tfidf_LR_model)
+ggplot(tfidf_LR_Im , aes(importance) +
+geom_bar() +
+coord_flip())
+
+add_LR_model <- train(label~., data = add_train_set, trControl = train_control, method = "glmnet")
+add_LR_pred = predict(add_LR_model, add_test_set)
+add_LR_result = confusionMatrix(add_LR_pred, add_test_set$label, mode = 'prec_recall')
+add_LR_Im = varImp(add_LR_model)
+ggplot(add_LR_Im , aes(importance) +
+geom_bar() +
+coord_flip())
+```
+
+## Result
+```{r}
+feature_LR_result
+tfidf_LR_result
+add_LR_result
+feature_SVM_result
+tfidf_SVM_result
+add_SVM_result
+feature_NB_result
+tfidf_NB_result
+add_NB_result
+feature_DT_result
+tfidf_DT_result
+add_DT_result
+feature_RF_result
+tfidf_RF_result
+add_RF_result
+```
+
+## Importance
+```{r}
+feature_LR_Im
+tfidf_LR_Im
+add_LR_Im
+feature_SVM_Im
+tfidf_SVM_Im
+add_SVM_Im
+feature_NB_Im
+tfidf_NB_Im
+add_NB_Im
+feature_DT_Im
+tfidf_DT_Im
+add_DT_Im
+feature_RF_Im
+tfidf_RF_Im
+add_RF_Im
+```
